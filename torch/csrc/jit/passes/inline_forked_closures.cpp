@@ -1,5 +1,5 @@
 #include <torch/csrc/jit/passes/inline_forked_closures.h>
-#include <torch/csrc/jit/script/compiler.h>
+#include <torch/csrc/jit/script/ir_emitter.h>
 
 namespace torch {
 namespace jit {
@@ -55,7 +55,7 @@ void inlineForkedClosure(Node* fork_closure) {
   fork_closure->output()->replaceAllUsesWith(fork_node->output());
   fork_closure->destroy();
   fork_node->g_(attr::Subgraph, fork_graph);
-  runCleanupPasses(fork_graph, /*convert_to_ssa */ false);
+  runCleanupPasses(fork_graph);
 }
 
 void inlineForkedClosures(Block* block) {

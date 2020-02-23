@@ -27,7 +27,7 @@ namespace c10 { namespace hip {
 // HIP occurs; instead, anywhere we see "CUDA", it actually means "HIP".
 // For example, when you use HIPified PyTorch, you say x.cuda() to
 // move a tensor onto ROCm device.  We call this situation "HIP
-// maquerading as CUDA".
+// masquerading as CUDA".
 //
 // This leads to a very awkward situation when we want to call c10_hip
 // code from PyTorch, since c10_hip is expecting things to be called
@@ -44,7 +44,7 @@ namespace c10 { namespace hip {
 // we switch PyTorch to calling a HIP a HIP.
 //
 // When you add a new MasqueradingAsCUDA class/function, you need to
-// also update the rewrite rules in tools/amd_build/pyHIPIFY/cuda_to_hip_mappings.py
+// also update the rewrite rules in torch/utils/hipify/cuda_to_hip_mappings.py
 //
 //
 //
@@ -82,7 +82,10 @@ struct HIPGuardImplMasqueradingAsCUDA final : public c10::impl::DeviceGuardImplI
     C10_HIP_CHECK_WARN(hipSetDevice(d.index()));
   }
   Stream getStream(Device d) const noexcept override {
-    return getCurrentHIPStreamMasqueradingAsCUDA().unwrap();
+    return getCurrentHIPStreamMasqueradingAsCUDA(d.index()).unwrap();
+  }
+  Stream getDefaultStream(Device d) const override {
+    return getDefaultHIPStreamMasqueradingAsCUDA(d.index());
   }
   Stream exchangeStream(Stream s) const noexcept override {
     HIPStreamMasqueradingAsCUDA cs(s);

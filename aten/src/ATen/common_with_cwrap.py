@@ -30,8 +30,14 @@ def set_declaration_defaults(declaration):
         declaration['cname'] = declaration['name']
     if 'backends' not in declaration:
         declaration['backends'] = ['CPU', 'CUDA']
-    if 'api_name' not in declaration:
-        declaration['api_name'] = declaration['name']
+    assert 'api_name' not in declaration
+    declaration['api_name'] = declaration['name']
+    # NB: keep this in sync with gen_autograd.py
+    if declaration.get('overload_name'):
+        declaration['type_wrapper_name'] = "{}_{}".format(
+            declaration['name'], declaration['overload_name'])
+    else:
+        declaration['type_wrapper_name'] = declaration['name']
     # Simulate multiple dispatch, even if it's not necessary
     if 'options' not in declaration:
         declaration['options'] = [{'arguments': declaration['arguments']}]
@@ -53,7 +59,7 @@ def set_declaration_defaults(declaration):
 
 def filter_unique_options(options, allow_kwarg, type_to_signature, remove_self):
     def exclude_arg(arg):
-        return arg.get('ignore_check') or arg['type'] == 'CONSTANT'
+        return arg['type'] == 'CONSTANT'
 
     def exclude_arg_with_self_check(arg):
         return exclude_arg(arg) or (remove_self and arg['name'] == 'self')
@@ -91,10 +97,10 @@ def filter_unique_options(options, allow_kwarg, type_to_signature, remove_self):
     return unique
 
 
-def sort_by_number_of_options(declaration, reverse=True):
-    def num_checked_args(option):
-        return sum(map(lambda a: not a.get('ignore_check', False), option['arguments']))
-    declaration['options'].sort(key=num_checked_args, reverse=reverse)
+def sort_by_number_of_args(declaration, reverse=True):
+    def num_args(option):
+        return len(option['arguments'])
+    declaration['options'].sort(key=num_args, reverse=reverse)
 
 
 class Function(object):
