@@ -18,6 +18,8 @@
 
 #include <ATen/native/cuda/EmbeddingBackwardKernel.cuh>
 
+#include <c10/macros/Macros.h>
+
 namespace at {
 namespace native {
 
@@ -26,13 +28,6 @@ namespace {
 constexpr int MODE_SUM = 0;
 constexpr int MODE_MEAN = 1;
 constexpr int MODE_MAX = 2;
-
-#ifdef __HIP_PLATFORM_HCC__
-constexpr int WARP_SIZE = 64;
-#else
-constexpr int WARP_SIZE = 32;
-#endif
-
 
 // This kernel assumes that all input tensors except `weight` and
 // per_sample_weights are contiguous.
@@ -138,8 +133,8 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 
   int64_t stride = grad_weight.stride(0);
 
-  auto sorted_indices = at::empty_like(indices);
-  auto orig_indices = at::empty_like(indices);
+  auto sorted_indices = at::empty_like(indices, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+  auto orig_indices = at::empty_like(indices, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   using device_ptr = thrust::device_ptr<int64_t>;
 
   // Sort the inputs into sorted with the corresponding indices; we
@@ -164,7 +159,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 
   Tensor count;
   if (scale_grad_by_freq) {
-    count = at::empty_like(indices);
+    count = at::empty_like(indices, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
 
     auto allocator = THCThrustAllocator(globalContext().lazyInitCUDA());
     auto policy = thrust::cuda::par(allocator).on(stream);
@@ -213,7 +208,7 @@ __global__ void EmbeddingBag_accGradParametersKernel_max(
       int64_t word_idx = max_indices[bag * stride + featureDim];
       if (word_idx >= 0) {
         // If bag is empty, we have max_indices[idx] set to -1 in forward.
-        atomicAdd(&(gradWeight[word_idx * stride + featureDim]),
+        gpuAtomicAdd(&(gradWeight[word_idx * stride + featureDim]),
                 gradOutput[bag * stride + featureDim]);
       }
     }
@@ -258,7 +253,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor>
 _embedding_bag_cuda(const Tensor &weight, const Tensor &indices,
                    const Tensor &offsets, const bool scale_grad_by_freq,
                    const int64_t mode, bool sparse,
-                   const Tensor& per_sample_weights) {
+                   const Tensor& per_sample_weights,
+                   bool include_last_offset) {
   auto indices_arg = TensorArg(indices, "indices", 1);
   checkScalarType("embedding_bag_cuda", indices_arg, kLong);
   auto offsets_arg = TensorArg(offsets, "offsets", 1);
@@ -269,6 +265,15 @@ _embedding_bag_cuda(const Tensor &weight, const Tensor &indices,
 
   int64_t numIndices = indices.size(0);
   int64_t numBags = offsets.size(0);
+  if (include_last_offset) {
+    // Check https://github.com/pytorch/pytorch/issues/29019
+    // We plan to add one more element in offsets, which is equal to the size of
+    // indices. Currently for cuda devices, we still use the legacy
+    // implementation even this flag is enabled.
+    TORCH_CHECK(
+        numBags >= 1, "include_last_offset: numBags should be at least 1");
+    numBags -= 1;
+  }
   int64_t featureSize = weight.size(1);
 
   auto bag_size = at::zeros(offsets.sizes(), indices.options());
@@ -277,12 +282,12 @@ _embedding_bag_cuda(const Tensor &weight, const Tensor &indices,
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  auto output = at::zeros({offsets.size(0), weight.size(1)}, weight.options());
+  auto output = at::zeros({numBags, featureSize}, weight.options());
 
   Tensor max_indices;
 
   if (mode == MODE_MAX) {
-    max_indices = at::zeros({offsets.size(0), weight.size(1)}, indices.options());
+    max_indices = at::zeros({numBags, featureSize}, indices.options());
   } else {
     // No need to allocate if we aren't doing a backwards pass
     max_indices = at::zeros({0}, indices.options());
@@ -352,7 +357,7 @@ Tensor _embedding_bag_dense_backward_cuda(const Tensor &grad_, const Tensor &ind
 template <typename scalar_t>
 __inline__ __device__
 static scalar_t warpReduceSum(scalar_t val) {
-  for (int offset = WARP_SIZE/2; offset > 0; offset /= 2)
+  for (int offset = C10_WARP_SIZE/2; offset > 0; offset /= 2)
     val += WARP_SHFL_DOWN(val, offset);
   return val;
 }
@@ -368,9 +373,9 @@ __global__ static void _embedding_bag_per_sample_weights_backward_kernel(
     scalar_t* output) {
   using accscalar_t = acc_type<scalar_t, true>;
   const int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  const int warp = idx / WARP_SIZE;
-  const int thread_in_warp = idx % WARP_SIZE;
-  const int num_warps = blockDim.x * gridDim.x / WARP_SIZE;
+  const int warp = idx / C10_WARP_SIZE;
+  const int thread_in_warp = idx % C10_WARP_SIZE;
+  const int num_warps = blockDim.x * gridDim.x / C10_WARP_SIZE;
 
   // Each warp is responsible for the accumulation of one sample.
   // This involves doing one dot product between grad[bag_idx] and weight[embedding_idx].
@@ -379,7 +384,7 @@ __global__ static void _embedding_bag_per_sample_weights_backward_kernel(
     const int bag_idx = (int)offset2bag[sample_idx];
     const int embedding_idx = (int)indices[sample_idx];
     for (int feature_idx = thread_in_warp; feature_idx < embedding_features;
-        feature_idx += WARP_SIZE) {
+        feature_idx += C10_WARP_SIZE) {
       result +=
           grad[grad_stride0 * bag_idx + grad_stride1 * feature_idx] *
           weight[weight_stride0 * embedding_idx + weight_stride1 * feature_idx];
@@ -412,7 +417,7 @@ Tensor _embedding_bag_per_sample_weights_backward_cuda(
   AT_ASSERT(weight.size(1) == embedding_features);
 
   const int threads_per_block = 1024;
-  const int warps_per_block = threads_per_block / WARP_SIZE;
+  const int warps_per_block = threads_per_block / C10_WARP_SIZE;
 
   dim3 block(threads_per_block);
   dim3 grid((num_samples + warps_per_block - 1) / warps_per_block);

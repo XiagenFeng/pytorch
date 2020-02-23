@@ -1,10 +1,12 @@
 #include <ATen/AccumulateType.h>
+#include <ATen/NamedTensorUtils.h>
 #include <ATen/native/Pool.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAApplyUtils.cuh>
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
+#include <THC/THCAtomics.cuh>
 #include <THC/THCNumerics.cuh>
 #include <c10/macros/Macros.h>
 
@@ -20,8 +22,8 @@ __device__ inline int min(int a, int b) {
 template <typename scalar_t>
 __global__ static void max_pool3d_with_indices_single_out_frame(
   scalar_t* inputData,
-  PackedTensorAccessor<scalar_t, 4> output,
-  PackedTensorAccessor<int64_t, 4> indices,
+  PackedTensorAccessor64<scalar_t, 4> output,
+  PackedTensorAccessor64<int64_t, 4> indices,
   int itime, int iheight, int iwidth,
   int kT, int kH, int kW,
   int dT, int dH, int dW,
@@ -81,8 +83,8 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
 template <int KERNEL_WIDTH, typename scalar_t>
 __global__ static void max_pool3d_with_indices_single_out_frame(
   scalar_t* inputData,
-  PackedTensorAccessor<scalar_t, 4> output,
-  PackedTensorAccessor<int64_t, 4> indices,
+  PackedTensorAccessor64<scalar_t, 4> output,
+  PackedTensorAccessor64<int64_t, 4> indices,
   int itime, int iheight, int iwidth,
   int kT, int kH,
   int dT, int dH, int dW,
@@ -143,8 +145,8 @@ __global__ static void max_pool3d_with_indices_single_out_frame(
   max_pool3d_with_indices_single_out_frame<KW>            \
   <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>( \
     input_data,                                           \
-    output.packed_accessor<scalar_t, 4>(),                \
-    indices.packed_accessor<int64_t, 4>(),                \
+    output.packed_accessor64<scalar_t, 4>(),                \
+    indices.packed_accessor64<int64_t, 4>(),                \
     itime, iheight, iwidth,                               \
     kT, kH,                                               \
     dT, dH, dW,                                           \
@@ -185,8 +187,8 @@ void max_pool3d_with_indices_out_frame(
       max_pool3d_with_indices_single_out_frame
         <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
            input_data,
-           output.packed_accessor<scalar_t, 4>(),
-           indices.packed_accessor<int64_t, 4>(),
+           output.packed_accessor64<scalar_t, 4>(),
+           indices.packed_accessor64<int64_t, 4>(),
            itime, iheight, iwidth,
            kT, kH, kW,
            dT, dH, dW,
@@ -209,8 +211,8 @@ void max_pool3d_with_indices_out_frame(
 template <typename scalar_t>
 __global__ static void max_pool3d_with_indices_backward_single_out_frame(
   scalar_t *gradInputData,
-  PackedTensorAccessor<scalar_t, 4> gradOutput,
-  PackedTensorAccessor<int64_t, 4> indices,
+  PackedTensorAccessor64<scalar_t, 4> gradOutput,
+  PackedTensorAccessor64<int64_t, 4> indices,
   int itime, int iheight, int iwidth,
   int dT, int dH, int dW,
   int pT, int pH, int pW,
@@ -226,7 +228,7 @@ __global__ static void max_pool3d_with_indices_backward_single_out_frame(
   {
     int maxIndex = indices[slice][oFrame][oRow][oColumn];
     if (maxIndex != -1) {
-      atomicAdd(&gradInputData[slice * itime * iheight * iwidth + maxIndex],
+      gpuAtomicAdd(&gradInputData[slice * itime * iheight * iwidth + maxIndex],
                 gradOutput[slice][oFrame][oRow][oColumn]);
     }
   }
@@ -255,8 +257,8 @@ void max_pool3d_with_indices_backward_out_frame(
     max_pool3d_with_indices_backward_single_out_frame
       <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         gradInputData,
-        gradOutput.packed_accessor<scalar_t, 4>(),
-        indices.packed_accessor<int64_t, 4>(),
+        gradOutput.packed_accessor64<scalar_t, 4>(),
+        indices.packed_accessor64<int64_t, 4>(),
         itime, iheight, iwidth,
         dT, dH, dW,
         pT, pH, pW,
@@ -518,6 +520,8 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cuda(
   IntArrayRef dilation,
   bool ceil_mode)
 {
+  NoNamesGuard guard;
+
   Tensor output = at::empty({0}, input.options());
   Tensor indices = at::empty({0}, input.options().dtype(kLong));
   max_pool3d_with_indices_out_cuda_template(
@@ -529,6 +533,11 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cuda(
     padding,
     dilation,
     ceil_mode);
+
+  guard.reset();
+  namedinference::propagate_names(output, input);
+  namedinference::propagate_names(indices, input);
+
   return std::tuple<Tensor, Tensor>(output, indices);
 }
 
@@ -566,7 +575,7 @@ Tensor max_pool3d_with_indices_backward_cuda(
   bool ceil_mode,
   const Tensor& indices)
 {
-  auto gradInput = at::zeros_like(input);
+  auto gradInput = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   max_pool3d_with_indices_backward_out_cuda_template(
     gradInput,
     gradOutput,
