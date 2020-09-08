@@ -5,6 +5,7 @@ _params_t = Union[Iterable[Tensor], Iterable[dict]]
 
 
 class Optimizer:
+    defaults: dict
     state: dict
     param_groups: List[dict]
 
